@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Minimal EPUB Reader</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; padding: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+    #toolbar {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 10;
+      display: flex; gap: .5rem; align-items: center; padding: .5rem .75rem;
+      border-bottom: 1px solid rgba(0,0,0,.08); background: #fff;
+    }
+    #viewer {
+      position: absolute; top: 48px; left: 0; right: 0; bottom: 0;
+      /* Ensure the rendering container has dimensions */
+      width: 100%; height: calc(100% - 48px);
+      background: #f7f7f7;
+    }
+    .spacer { flex: 1; }
+    button, input, select, label { font-size: 14px; }
+    button { padding: .4rem .65rem; border-radius: 8px; border: 1px solid rgba(0,0,0,.12); background: #fafafa; }
+    button:active { transform: translateY(1px); }
+    #progress { font-variant-numeric: tabular-nums; }
+    @media (prefers-color-scheme: dark) {
+      #toolbar { background: #111; color: #f2f2f2; border-bottom-color: rgba(255,255,255,.1); }
+      button { background: #1a1a1a; color: #eaeaea; border-color: rgba(255,255,255,.12); }
+      #viewer { background: #0c0c0c; }
+      input, label { color: #eaeaea; }
+    }
+  </style>
+</head>
+<body>
+  <div id="toolbar">
+    <label for="file">Open EPUB</label>
+    <input id="file" type="file" accept=".epub" />
+    <button id="prev" title="Previous page">⟨</button>
+    <button id="next" title="Next page">⟩</button>
+    <span class="spacer"></span>
+    <button id="smaller" title="Smaller font">A−</button>
+    <button id="larger" title="Larger font">A+</button>
+    <span id="progress" aria-live="polite">—%</span>
+  </div>
+  <div id="viewer" role="main" aria-label="EPUB content"></div>
+
+  <!-- Epub.js (CDN) -->
+  <script src="https://unpkg.com/epubjs/dist/epub.min.js"></script>
+
+  <script>
+    (function() {
+      const viewer = document.getElementById("viewer");
+      const fileInput = document.getElementById("file");
+      const btnPrev = document.getElementById("prev");
+      const btnNext = document.getElementById("next");
+      const btnSmaller = document.getElementById("smaller");
+      const btnLarger = document.getElementById("larger");
+      const progressEl = document.getElementById("progress");
+
+      let book = null;
+      let rendition = null;
+      let currentFontSize = 100; // percent
+      const LS_KEY_CFI = "epubjs:last-cfi";
+      const params = new URLSearchParams(location.search);
+      const initialBookUrl = params.get("book");   // optional ?book=https://.../my.epub
+      const initialCfi = params.get("cfi");        // optional ?cfi=epubcfi(...)
+
+      function destroyBook() {
+        try {
+          if (rendition) { rendition.destroy(); }
+          if (book) { book.destroy(); }
+        } catch (e) {}
+        book = null;
+        rendition = null;
+      }
+
+      function updateProgress(loc) {
+        if (!book || !book.locations) return;
+        let pct = 0;
+        try {
+          const cfi = loc?.start?.cfi || rendition?.currentLocation()?.start?.cfi;
+          if (cfi && book.locations.length) {
+            pct = book.locations.percentageFromCfi(cfi) * 100;
+          }
+        } catch (e) {}
+        progressEl.textContent = (pct ? pct.toFixed(1) : "0.0") + "%";
+      }
+
+      async function openBookFromArrayBuffer(buffer) {
+        destroyBook();
+        book = ePub(buffer);
+        await initRendition();
+      }
+
+      async function openBookFromUrl(url) {
+        // Prefer fetching to avoid CORS/Range-Request issues with some hosts.
+        destroyBook();
+        try {
+          const res = await fetch(url);
+          const buf = await res.arrayBuffer();
+          await openBookFromArrayBuffer(buf);
+        } catch (e) {
+          // Fallback: let epub.js try loading the URL directly
+          book = ePub(url);
+          await initRendition();
+        }
+      }
+
+      async function initRendition() {
+        rendition = book.renderTo("viewer", {
+          width: "100%",
+          height: "100%",
+          flow: "paginated",   // "scrolled-doc" also works
+          allowScriptedContent: true
+        });
+
+        rendition.themes.default({
+          "body": { "background": "transparent" },  // match page bg
+          "p,span,div,li": { "line-height": "1.5" }
+        });
+        rendition.themes.fontSize(currentFontSize + "%");
+
+        rendition.on("relocated", (location) => {
+          try {
+            const cfi = location?.start?.cfi;
+            if (cfi) {
+              localStorage.setItem(LS_KEY_CFI, cfi);
+              updateProgress(location);
+            }
+          } catch (e) {}
+        });
+
+        // Show first render
+        await rendition.display(initialCfi || localStorage.getItem(LS_KEY_CFI) || undefined);
+
+        // Generate locations for progress; 1500 chars per location is a decent default.
+        try {
+          await book.ready;
+          await book.locations.generate(1500);
+          updateProgress(rendition.currentLocation());
+        } catch (e) {
+          // Locations generation can fail on very small books; ignore.
+        }
+
+        // Tap/click to navigate: left third = prev, right third = next
+        viewer.addEventListener("click", (ev) => {
+          const x = ev.clientX / viewer.clientWidth;
+          if (x < 0.33) rendition.prev();
+          else if (x > 0.66) rendition.next();
+        }, { passive: true });
+      }
+
+      // Controls
+      btnPrev.addEventListener("click", () => rendition && rendition.prev());
+      btnNext.addEventListener("click", () => rendition && rendition.next());
+      btnSmaller.addEventListener("click", () => {
+        currentFontSize = Math.max(60, currentFontSize - 10);
+        if (rendition) rendition.themes.fontSize(currentFontSize + "%");
+      });
+      btnLarger.addEventListener("click", () => {
+        currentFontSize = Math.min(200, currentFontSize + 10);
+        if (rendition) rendition.themes.fontSize(currentFontSize + "%");
+      });
+
+      // File input (works on desktop + most mobile webviews)
+      fileInput.addEventListener("change", (e) => {
+        const file = e.target.files && e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (ev) => openBookFromArrayBuffer(ev.target.result);
+        reader.readAsArrayBuffer(file);
+      });
+
+      // Auto-open if ?book= is provided
+      if (initialBookUrl) {
+        openBookFromUrl(initialBookUrl);
+      } else {
+        // Render an empty stage so the container is valid even before a book is loaded.
+        viewer.innerHTML = "<div style='padding:12px;color:#666;'>Use “Open EPUB” to choose a file, or pass ?book=URL</div>";
+      }
+    })();
+  </script>
+</body>
+</html>
